@@ -18,10 +18,9 @@ export interface CompletedRecord {
 
 export type IdempotencyRecord = InProgressRecord | CompletedRecord
 
-const fingerprintSchema = z
-  .string()
-  .regex(/^[0-9a-f]{64}$/)
-  .nullable()
+export const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/
+
+const fingerprintSchema = z.string().regex(FINGERPRINT_PATTERN).nullable()
 
 const timestampSchema = z.number().int().nonnegative()
 
