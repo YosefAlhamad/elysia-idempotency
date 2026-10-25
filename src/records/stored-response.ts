@@ -123,10 +123,16 @@ export class ResponseSnapshot {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) return Buffer.concat(chunks, total)
-      if (!(value instanceof Uint8Array)) throw new TypeError('Response body chunk is not bytes')
-      total += value.byteLength
+      const bytes = ResponseSnapshot.chunkBytes(value)
+      total += bytes.byteLength
       if (total > maxBodyBytes) return null
-      if (value.byteLength > 0) chunks.push(value)
+      if (bytes.byteLength > 0) chunks.push(bytes)
     }
+  }
+
+  private static chunkBytes(value: unknown): Uint8Array {
+    if (value instanceof Uint8Array) return value
+    if (typeof value === 'string') return Buffer.from(value, 'utf8')
+    throw new TypeError('Response body chunk is not bytes')
   }
 }

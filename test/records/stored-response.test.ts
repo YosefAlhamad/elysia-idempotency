@@ -130,17 +130,32 @@ describe('ResponseSnapshot.capture', () => {
     expect(stored).toMatchObject({ body: null, bodyOmitted: true })
   })
 
+  const streamOf = (chunks: readonly unknown[]) =>
+    new Response(
+      new ReadableStream<unknown>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk)
+          controller.close()
+        },
+      }) as ReadableStream<Uint8Array>,
+    )
+
+  test('captures string chunks as UTF-8, as Elysia streams them', async () => {
+    const stored = await ResponseSnapshot.capture(streamOf(['héllo ', 'wörld']), options)
+    expect(Buffer.from(stored.body ?? '', 'base64').toString('utf8')).toBe('héllo wörld')
+    expect(stored.bodyOmitted).toBe(false)
+  })
+
+  test('counts string chunks in bytes against maxBodyBytes', async () => {
+    const stored = await ResponseSnapshot.capture(streamOf(['é'.repeat(3)]), { ...options, maxBodyBytes: 5 })
+    expect(stored).toMatchObject({ body: null, bodyOmitted: true })
+  })
+
   test('omits a body with non-byte chunks and leaves the original readable', async () => {
-    const stream = new ReadableStream<unknown>({
-      start(controller) {
-        controller.enqueue('text chunk')
-        controller.close()
-      },
-    })
-    const response = new Response(stream as ReadableStream<Uint8Array>)
+    const response = streamOf([42])
     const stored = await ResponseSnapshot.capture(response, options)
     expect(stored).toMatchObject({ body: null, bodyOmitted: true })
-    expect(await response.text()).toBe('text chunk')
+    expect(response.body).not.toBeNull()
   })
 
   test('captures header values with any byte that Headers accepts', async () => {

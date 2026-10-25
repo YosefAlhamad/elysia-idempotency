@@ -19,7 +19,7 @@ export const idempotencyEngineOptionsShape = {
   clock: z.custom<Clock>(isClock, 'Expected an object with a now() method').optional(),
 }
 
-interface DurationOptions {
+export interface DurationOptions {
   readonly retention: number
   readonly lockTimeout: number
 }
