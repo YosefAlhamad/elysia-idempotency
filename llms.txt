@@ -1,0 +1,185 @@
+# elysia-idempotency
+
+Idempotency-Key plugin for Elysia on Bun. A retried POST or PATCH with the same Idempotency-Key header runs the handler once; every retry gets the original status, headers, and body plus the header Idempotent-Replayed: true. Requests are fingerprinted (method, path with query, body hash), so a reused key with a different request gets 422. Records are scoped by client identity, so one client never receives another client's response. In-memory and Redis stores, options validated with Zod. Also usable outside Elysia through the IdempotencyEngine class.
+
+## Install
+
+bun add elysia-idempotency
+
+Peer dependencies: elysia ^1.4.30, zod ^4.6.7. Requires Bun 1.3 or newer.
+
+## Public API
+
+import {
+  idempotency, IdempotencyEngine, MemoryStore, RedisStore, isIdempotencyStore, SystemClock,
+  IdempotencyError, IdempotencyConfigError, StoreConflictError, StoreUnavailableError,
+  idempotencyEngineOptionsSchema, idempotencyPluginOptionsSchema,
+} from 'elysia-idempotency'
+
+import type {
+  IdempotencyPlugin, IdempotencyPluginOptions, IdempotencyEngineOptions, IdempotencyOutcome,
+  IdempotencyRejection, IdempotencyLease, BeginOutcome, StoredResponse, IdempotencyStore,
+  StoreMutation, StoreWrite, RedisCommandClient, Clock, IdempotencyRequestContext, TrustProxy,
+} from 'elysia-idempotency'
+
+idempotency(options?: IdempotencyPluginOptions): IdempotencyPlugin
+  Elysia plugin. Adds ctx.idempotency: IdempotencyOutcome to handlers.
+  Throws IdempotencyConfigError immediately on invalid options.
+
+class IdempotencyEngine
+  constructor(options?: IdempotencyEngineOptions)
+  begin(input: { scope: string; key: string; fingerprint: string | null }): Promise<BeginOutcome>
+  complete(lease: IdempotencyLease, response: StoredResponse): Promise<boolean>
+  release(lease: IdempotencyLease): Promise<boolean>
+  close(): Promise<void>
+  fingerprint is 64 lowercase hex characters or null. close() only closes a store the engine created.
+
+class MemoryStore implements IdempotencyStore
+  constructor(options?: { maxKeys?: number; maxBytes?: number; sweepIntervalMs?: number; clock?: Clock })
+  readonly size: number
+  readonly bytes: number
+  Per process only. Defaults: maxKeys 10000, maxBytes 64 MiB, sweepIntervalMs 60000.
+  Never evicts a live record; when full, new keys fail with StoreUnavailableError (503 in closed mode).
+
+class RedisStore implements IdempotencyStore
+  constructor(options: { client: RedisCommandClient; maxAttempts?: number })
+  Atomic across instances via a compare-and-set Lua script. maxAttempts default 5, range 1 to 20.
+
+interface RedisCommandClient { send(command: string, args: string[]): Promise<unknown> }
+  Bun's RedisClient from 'bun' fits as is.
+  ioredis: { send: (command, args) => redis.call(command, ...args) }
+  node-redis: { send: (command, args) => redis.sendCommand([command, ...args]) }
+
+interface IdempotencyStore {
+  read(key: string): Promise<string | null>
+  update<TResult>(key: string, mutation: StoreMutation<TResult>): Promise<TResult>
+  delete(key: string): Promise<void>
+  close?(): Promise<void>
+}
+type StoreMutation<TResult> = (current: string | null) => StoreWrite<TResult>
+type StoreWrite<TResult> =
+  | { readonly action: 'set'; readonly value: string; readonly ttlMs: number; readonly result: TResult }
+  | { readonly action: 'delete'; readonly result: TResult }
+  | { readonly action: 'keep'; readonly result: TResult }
+update must be atomic per key.
+
+type IdempotencyOutcome =
+  | { readonly status: 'skipped' }
+  | { readonly status: 'started'; readonly key: string }
+  | { readonly status: 'replayed' }
+  | { readonly status: 'rejected'; readonly rejection: IdempotencyRejection }
+  | { readonly status: 'unavailable'; readonly error: IdempotencyError }
+
+type IdempotencyRejection =
+  | { readonly reason: 'missing-key'; readonly status: 400 }
+  | { readonly reason: 'invalid-key'; readonly status: 400 }
+  | { readonly reason: 'in-progress'; readonly status: 409 }
+  | { readonly reason: 'mismatch'; readonly status: 422 }
+  | { readonly reason: 'unavailable'; readonly status: 503 }
+
+type BeginOutcome =
+  | { readonly kind: 'started'; readonly lease: IdempotencyLease }
+  | { readonly kind: 'replay'; readonly response: StoredResponse }
+  | { readonly kind: 'in-progress' }
+  | { readonly kind: 'mismatch' }
+
+interface IdempotencyLease { readonly storeKey: string; readonly token: string; readonly fingerprint: string | null }
+
+interface StoredResponse {
+  readonly status: number
+  readonly headers: ReadonlyArray<readonly [string, string]>
+  readonly body: string | null
+  readonly bodyOmitted: boolean
+}
+status 200 to 599, body base64 or null, bodyOmitted true requires body null.
+
+interface IdempotencyRequestContext {
+  readonly request: Request
+  readonly path: string
+  readonly ip: string | null
+  readonly elysia: Context
+}
+
+interface Clock { now(): number }
+type TrustProxy = boolean | number
+
+## Options
+
+IdempotencyEngineOptions (IdempotencyEngine) and IdempotencyPluginOptions (idempotency) share the first five. Unknown keys are rejected.
+
+store: IdempotencyStore, default a new MemoryStore owned and closed by the engine or plugin.
+prefix: string, default 'idempotency'. 1 to 64 of A-Z a-z 0-9 _ -. Use a different prefix per plugin on a shared store.
+retention: number | string, default '24h'. How long a completed response is replayed. Milliseconds or "30s", "15m", "24h", "7d". 1 second to 30 days.
+lockTimeout: number | string, default '1m'. How long an in-progress lock lives. 1 second to 1 hour, at most retention. Set it longer than the slowest handler.
+clock: Clock, default system clock.
+
+Plugin only:
+header: string, default 'Idempotency-Key'.
+methods: string[], default ['POST', 'PATCH']. Must not include GET, HEAD, OPTIONS.
+required: boolean, default false. true answers 400 when a covered request has no key.
+fingerprint: boolean | (ctx) => string | Promise<string>, default true. true = method, path with query, raw body. false = never compare requests. Function = your own string, hashed before storing.
+identity: (ctx) => string | Promise<string>. Default: 'auth:' + Authorization header, else 'ip:' + client IP, else 'anonymous'. Records never cross identities. Cookie-session apps should return the user id.
+trustProxy: boolean | number, default false. Default identity only. Number = proxies in front of the app (1 to 32).
+ipv6Subnet: number 0 to 128, default 56. Default identity only.
+maxBodyBytes: number 0 to 16 MiB, default 1 MiB. Larger response bodies are not stored; the replay keeps status and headers with an empty body.
+shouldStore: (status: number) => boolean. Default stores status < 500 except 401, 403, 408, 409, 425, 429. Other statuses release the key.
+excludeHeaders: string[], default []. Extra response headers never stored. Set-Cookie, Authorization, hop-by-hop, Content-Length, Date, Retry-After, RateLimit-* are always excluded.
+failureMode: 'open' | 'closed', default 'closed'. Store failure: answer 503, or run the handler without protection. Closed is the default because failing open is when a payment can run twice.
+onRejected: (ctx, rejection) => unknown, may be async. Custom body or Response. undefined, null, or a throw uses the default body.
+scope: 'global' | 'scoped' | 'local', default 'scoped'. Hooks cover only routes registered after .use().
+
+## Status codes
+
+replay: original status and body, header Idempotent-Replayed: true. Treat like the first response.
+400 { "error": "Idempotency-Key header is required" }: required is true and no key was sent.
+400 { "error": "Idempotency-Key header is invalid" }: key must be 1 to 255 printable ASCII characters without space, '"', '\', and a single value. Quoted "abc" is accepted.
+409 { "error": "A request with this Idempotency-Key is still in progress" }, Retry-After: 1. Retry with the same key.
+422 { "error": "Idempotency-Key was already used with a different request" }. Client bug; use a new key.
+503 { "error": "Idempotency is temporarily unavailable" }, Retry-After: 1. Store failed in closed mode; retry with the same key.
+
+A thrown handler error or a 5xx releases the key, so a retry runs again. Return status(402, body) to store an error; throw to keep it retryable.
+This plugin does not replace database unique constraints.
+MemoryStore protects one process; use RedisStore in production and for more than one instance.
+With elysia-rate-limiter, .use(rateLimit(...)) before .use(idempotency(...)).
+
+## Example: Elysia app with Redis
+
+import { RedisClient } from 'bun'
+import { Elysia, t } from 'elysia'
+import { RedisStore, idempotency } from 'elysia-idempotency'
+
+const store = new RedisStore({ client: new RedisClient(process.env.REDIS_URL ?? 'redis://localhost:6379') })
+
+const payments = new Elysia({ prefix: '/payments' })
+  .use(idempotency({ store, prefix: 'payments', required: true, trustProxy: 1 }))
+  .post(
+    '/',
+    ({ body, status, idempotency }) => {
+      if (body.amount > 100_000) return status(402, { error: 'card_declined' })
+      return status(201, { amount: body.amount, key: idempotency.status === 'started' ? idempotency.key : null })
+    },
+    { body: t.Object({ amount: t.Integer({ minimum: 1 }) }) },
+  )
+
+const app = new Elysia().use(payments).listen(3000)
+
+Client: const key = crypto.randomUUID(), send header 'Idempotency-Key': key, reuse key and identical body on retry.
+
+## Example: IdempotencyEngine in a queue consumer
+
+import { IdempotencyEngine } from 'elysia-idempotency'
+
+const engine = new IdempotencyEngine({ retention: '7d', lockTimeout: '5m' })
+
+const handle = async (message: { id: string; orderId: string }, work: () => Promise<void>) => {
+  const outcome = await engine.begin({ scope: 'orders', key: message.id, fingerprint: null })
+  if (outcome.kind !== 'started') return outcome.kind
+  try {
+    await work()
+    await engine.complete(outcome.lease, { status: 200, headers: [], body: null, bodyOmitted: false })
+    return 'done'
+  } catch (error) {
+    await engine.release(outcome.lease)
+    throw error
+  }
+}
