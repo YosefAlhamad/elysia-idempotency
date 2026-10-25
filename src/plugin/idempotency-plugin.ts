@@ -34,6 +34,7 @@ interface Checked {
 
 interface RequestState {
   readonly fingerprint?: Promise<string>
+  readonly stopFingerprint?: AbortController
   readonly context?: IdempotencyRequestContext
   readonly checked?: Checked
 }
@@ -69,10 +70,15 @@ class IdempotencyGuard {
 
   prepare(request: Request): void {
     if (this.settings.fingerprint !== true || !this.covers(request)) return
-    if (request.headers.get(this.settings.header) === null) return
-    const fingerprint = RequestFingerprint.compute(request)
+    if (IdempotencyKey.parse(request.headers.get(this.settings.header)).status !== 'valid') return
+    const stopFingerprint = new AbortController()
+    const fingerprint = RequestFingerprint.compute(request, stopFingerprint.signal)
     fingerprint.catch(() => undefined)
-    this.states.set(request, { fingerprint })
+    this.states.set(request, { fingerprint, stopFingerprint })
+  }
+
+  discard(request: Request): void {
+    this.states.get(request)?.stopFingerprint?.abort()
   }
 
   async check(elysia: IdempotencyElysiaContext): Promise<IdempotencyOutcome> {
@@ -203,7 +209,9 @@ export const idempotency = (options: IdempotencyPluginOptions = {}) => {
     .onBeforeHandle(scope, async (context) => guard.respond(context))
     .mapResponse(scope, async (context) => guard.finish(context))
     .onError(scope, async ({ request }) => guard.abandon(request))
+    .onError({ as: 'global' }, ({ request }) => guard.discard(request))
     .onAfterResponse(scope, async ({ request }) => guard.abandon(request))
+    .onAfterResponse({ as: 'global' }, ({ request }) => guard.discard(request))
     .onStop(async () => guard.close())
 }
 

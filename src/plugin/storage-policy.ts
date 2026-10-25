@@ -2,7 +2,7 @@ import { MAX_STORED_STATUS, MIN_STORED_STATUS } from '../records/stored-response
 
 const SERVER_ERROR_STATUS = 500
 
-const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([408, 409, 425, 429])
+const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([401, 403, 408, 409, 425, 429])
 
 export type ShouldStore = (status: number) => boolean
 

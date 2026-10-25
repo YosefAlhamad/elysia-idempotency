@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test'
 import { Elysia, t } from 'elysia'
 import { IdempotencyEngine } from '../../src/engine/idempotency-engine'
 import { StoreConflictError } from '../../src/errors'
+import { RequestFingerprint } from '../../src/fingerprint/request-fingerprint'
 import { KeyBuilder } from '../../src/keys/key-builder'
 import { type IdempotencyOutcome, idempotency } from '../../src/plugin/idempotency-plugin'
 import type { IdempotencyPluginOptions, IdempotencyRequestContext } from '../../src/plugin/plugin-schema'
@@ -9,6 +10,7 @@ import type { IdempotencyRejection } from '../../src/plugin/rejection-response'
 import { ResponseCapture } from '../../src/plugin/response-capture'
 import { MemoryStore } from '../../src/stores/memory-store'
 import type { IdempotencyStore } from '../../src/stores/store'
+import { deferred } from '../helpers/deferred'
 import { ManualClock } from '../helpers/manual-clock'
 import { ObservedStore } from '../helpers/observed-store'
 
@@ -105,6 +107,33 @@ describe('idempotency replay', () => {
     expect(await replay.text()).toBe('ok')
   })
 
+  test('never stores or replays auth and hop-by-hop headers', async () => {
+    const secretHeaders = {
+      authorization: 'Bearer secret-token',
+      'proxy-authenticate': 'Basic realm="secret"',
+      'proxy-authorization': 'Basic c2VjcmV0',
+      connection: 'close',
+      'keep-alive': 'timeout=5',
+      trailer: 'x-checksum',
+      upgrade: 'websocket',
+    }
+    const store = new MemoryStore({ clock: new ManualClock() })
+    const app = new Elysia()
+      .use(idempotency({ store, clock: new ManualClock() }))
+      .post('/session', ({ set }) => {
+        Object.assign(set.headers, secretHeaders, { 'x-account': 'acct_1' })
+        return 'ok'
+      })
+    await app.handle(send('/session'))
+    const replay = await app.handle(send('/session'))
+    const stored = await store.read(new KeyBuilder('idempotency').build('anonymous', KEY))
+    expect(stored).toContain('x-account')
+    expect(stored).not.toContain('secret')
+    expect(stored).not.toContain('c2VjcmV0')
+    expect(replay.headers.get('x-account')).toBe('acct_1')
+    for (const name of Object.keys(secretHeaders)) expect(replay.headers.get(name)).toBeNull()
+  })
+
   test('stores a status() error so a declined payment is not charged twice', async () => {
     let runs = 0
     const app = new Elysia()
@@ -186,6 +215,8 @@ describe('idempotency coverage of requests', () => {
     ['too long', 'k'.repeat(256)],
     ['with spaces', 'two words'],
     ['with control characters', 'bad\u0001key'],
+    ['with a tab', 'bad\tkey'],
+    ['with DEL', 'bad\u007fkey'],
     ['with several values', 'one, two'],
     ['with a backslash', 'back\\slash'],
   ])('answers 400 for a key %s and never touches the store', async (_, key) => {
@@ -195,7 +226,7 @@ describe('idempotency coverage of requests', () => {
     expect(response.status).toBe(400)
     expect(await response.json()).toEqual({ error: 'Idempotency-Key header is invalid' })
     expect(runs).toHaveLength(0)
-    expect(store.writes).toEqual([])
+    expect(store.calls).toBe(0)
   })
 
   test('reads the key from a custom header and covers custom methods', async () => {
@@ -249,6 +280,27 @@ describe('idempotency fingerprints', () => {
     expect(runs).toBe(1)
   })
 
+  test('never starts hashing for an invalid key', async () => {
+    const compute = spyOn(RequestFingerprint, 'compute')
+    const { app } = createApp()
+    await app.handle(send('/payments', { key: 'bad key' }))
+    const calls = compute.mock.calls.length
+    compute.mockRestore()
+    expect(calls).toBe(0)
+  })
+
+  test('stops hashing the body of a request that no route handles', async () => {
+    const compute = spyOn(RequestFingerprint, 'compute')
+    const { app } = createApp()
+    const body = new ReadableStream<Uint8Array>({ start: (controller) => controller.enqueue(new Uint8Array(16)) })
+    const request = new Request('http://localhost/missing', { method: 'POST', headers: { 'idempotency-key': KEY }, body })
+    const response = await app.handle(request)
+    const hashing = compute.mock.results[0]?.value
+    compute.mockRestore()
+    expect(response.status).toBe(404)
+    await expect(hashing).rejects.toThrow()
+  })
+
   test('fingerprint false replays even when the body changes', async () => {
     const { app, runs } = createApp({ fingerprint: false })
     await app.handle(send('/payments'))
@@ -278,6 +330,7 @@ describe('idempotency fingerprints', () => {
     const { app, runs } = createApp({ fingerprint: () => 42 as unknown as string })
     const response = await app.handle(send('/payments'))
     expect(response.status).toBe(500)
+    expectNoLeaks(await response.text())
     expect(runs).toHaveLength(0)
   })
 })
@@ -321,6 +374,7 @@ describe('idempotency identity', () => {
     const { app, runs } = createApp({ identity: () => null as unknown as string })
     const response = await app.handle(send('/payments'))
     expect(response.status).toBe(500)
+    expectNoLeaks(await response.text())
     expect(runs).toHaveLength(0)
   })
 })
@@ -505,6 +559,7 @@ describe('idempotency failureMode', () => {
     expect(await response.text()).toBe('paid')
     if (outcome?.status !== 'unavailable') throw new Error('Expected an unavailable outcome')
     expect(outcome.error.name).toBe('StoreUnavailableError')
+    expectNoLeaks(outcome.error.message)
     expect(outcome.error.cause).toBe(failure)
   })
 
@@ -513,6 +568,73 @@ describe('idempotency failureMode', () => {
     await app.handle(send('/payments'))
     const mismatch = await app.handle(send('/payments', { body: { amount: 1 } }))
     expectNoLeaks(await mismatch.text())
+  })
+})
+
+describe('idempotency store capacity', () => {
+  const userApp = (store: IdempotencyStore) => {
+    const runs: string[] = []
+    const app = new Elysia()
+      .use(idempotency({ store, identity: ({ request }) => request.headers.get('x-user') ?? 'guest' }))
+      .post('/charge', ({ headers, status }) => {
+        const user = headers['x-user']
+        if (user === undefined) return status(401, 'unauthorized')
+        runs.push(user)
+        return status(201, { charge: runs.length })
+      })
+    return { app, runs }
+  }
+
+  const charge = (user: string | null, key: string) =>
+    send('/charge', { key, headers: user === null ? {} : { 'x-user': user } })
+
+  test("a flood from other identities never makes a victim's retry run again", async () => {
+    const { app, runs } = userApp(new MemoryStore({ maxKeys: 5, clock: new ManualClock() }))
+    await app.handle(charge('victim', 'victim-pay-1'))
+    const flood = []
+    for (let index = 0; index < 20; index += 1) flood.push((await app.handle(charge('attacker', `flood-${index}`))).status)
+    const retry = await app.handle(charge('victim', 'victim-pay-1'))
+    expect(flood).toContain(503)
+    expect(retry.headers.get('idempotent-replayed')).toBe('true')
+    expect(runs.filter((user) => user === 'victim')).toHaveLength(1)
+  })
+
+  test('unauthenticated 401 responses take no capacity', async () => {
+    const store = new MemoryStore({ maxKeys: 5, clock: new ManualClock() })
+    const { app } = userApp(store)
+    for (let index = 0; index < 20; index += 1) expect((await app.handle(charge(null, `flood-${index}`))).status).toBe(401)
+    expect(store.size).toBe(0)
+    expect((await app.handle(charge('victim', 'victim-pay-1'))).status).toBe(201)
+  })
+
+  test("a flood never releases another request's in-progress lock", async () => {
+    const store = new MemoryStore({ maxKeys: 2, clock: new ManualClock() })
+    const gate = deferred()
+    let victimRuns = 0
+    const app = new Elysia()
+      .use(idempotency({ store, identity: ({ request }) => request.headers.get('x-user') ?? 'guest' }))
+      .post('/charge', async ({ headers }) => {
+        if (headers['x-user'] !== 'victim') return 'flood'
+        victimRuns += 1
+        await gate.promise
+        return 'charged'
+      })
+    const held = app.handle(charge('victim', 'victim-pay-1'))
+    const flood = [(await app.handle(charge('attacker', 'flood-1'))).status, (await app.handle(charge('attacker', 'flood-2'))).status]
+    const duplicate = await app.handle(charge('victim', 'victim-pay-1'))
+    gate.resolve()
+    await held
+    expect(flood).toEqual([200, 503])
+    expect(duplicate.status).toBe(409)
+    expect(victimRuns).toBe(1)
+  })
+
+  test('a full store answers 503 for new keys in closed mode', async () => {
+    const { app } = userApp(new MemoryStore({ maxKeys: 1, clock: new ManualClock() }))
+    await app.handle(charge('a', 'k1'))
+    const response = await app.handle(charge('b', 'k2'))
+    expect(response.status).toBe(503)
+    expectNoLeaks(await response.text())
   })
 })
 

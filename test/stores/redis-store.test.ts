@@ -248,13 +248,15 @@ describe('RedisStore with FakeRedis', () => {
   test('throws StoreConflictError after maxAttempts conflicts', async () => {
     const redis = new FakeRedis()
     const store = new RedisStore({ client: redis, maxAttempts: 3 })
+    const storeKey = 'idempotency:secret-store-key'
     let writes = 0
     redis.onBeforeScript(() => {
       writes += 1
-      redis.set('a', `other-${writes}`, 10_000)
+      redis.set(storeKey, `other-${writes}`, 10_000)
     })
-    const update = store.update('a', counter())
-    await expect(update).rejects.toBeInstanceOf(StoreConflictError)
+    const error = await store.update(storeKey, counter()).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(StoreConflictError)
+    expect(String(error)).not.toContain('secret-store-key')
     expect(writes).toBe(3)
   })
 

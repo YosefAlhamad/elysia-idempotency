@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
-import { IdempotencyConfigError } from '../../src/errors'
+import { IdempotencyConfigError, StoreUnavailableError } from '../../src/errors'
 import { MemoryStore, type MemoryStoreOptions } from '../../src/stores/memory-store'
 import { ManualClock } from '../helpers/manual-clock'
 
@@ -28,11 +28,12 @@ describe('MemoryStore options', () => {
     expect(store.bytes).toBe(0)
   })
 
-  test('holds at most 10,000 keys by default', async () => {
+  test('holds at most 10,000 keys by default and refuses the next one', async () => {
     const store = createStore({ clock: new ManualClock() })
-    for (let index = 0; index <= 10_000; index += 1) await put(store, `key-${index}`, '1')
+    for (let index = 0; index < 10_000; index += 1) await put(store, `key-${index}`, '1')
+    await expect(put(store, 'key-10000', '1')).rejects.toBeInstanceOf(StoreUnavailableError)
     expect(store.size).toBe(10_000)
-    expect(await store.read('key-0')).toBeNull()
+    expect(await store.read('key-0')).toBe('1')
   })
 
   test.each<[string, unknown]>([
@@ -121,31 +122,25 @@ describe('MemoryStore keep action', () => {
     expect(await store.read('a')).toBeNull()
   })
 
-  test('does not move the key in the LRU order', async () => {
-    const store = createStore({ maxKeys: 2, clock: new ManualClock() })
+  test('succeeds on a full store', async () => {
+    const store = createStore({ maxKeys: 1, clock: new ManualClock() })
     await put(store, 'a', 'one')
-    await put(store, 'b', 'two')
     expect(await get(store, 'a')).toBe('one')
-    await put(store, 'c', 'three')
-    expect(await store.read('a')).toBeNull()
-    expect(await store.read('b')).toBe('two')
-    expect(await store.read('c')).toBe('three')
+    expect(await get(store, 'b')).toBeNull()
   })
 })
 
 describe('MemoryStore.read', () => {
-  test('returns the value without writing, refreshing the TTL, or reordering keys', async () => {
+  test('returns the value without writing or refreshing the TTL', async () => {
     const clock = new ManualClock()
-    const store = createStore({ clock, maxKeys: 2 })
+    const store = createStore({ clock })
     expect(await store.read('a')).toBeNull()
     expect(store.size).toBe(0)
     await put(store, 'a', 'one', 100)
-    await put(store, 'b', 'two', 100)
+    clock.advance(99)
     expect(await store.read('a')).toBe('one')
-    await put(store, 'c', 'three', 100)
+    clock.advance(1)
     expect(await store.read('a')).toBeNull()
-    clock.advance(100)
-    expect(await store.read('b')).toBeNull()
   })
 })
 
@@ -191,30 +186,63 @@ describe('MemoryStore TTL', () => {
   })
 })
 
-describe('MemoryStore LRU', () => {
-  test('evicts the least recently updated key first', async () => {
-    const store = createStore({ maxKeys: 3, clock: new ManualClock() })
+describe('MemoryStore capacity', () => {
+  test('refuses a new key when full of live entries and keeps every entry', async () => {
+    const store = createStore({ maxKeys: 2, clock: new ManualClock() })
     await put(store, 'a', '1')
     await put(store, 'b', '2')
-    await put(store, 'c', '3')
+    await expect(put(store, 'c', '3')).rejects.toBeInstanceOf(StoreUnavailableError)
+    expect(store.size).toBe(2)
+    expect(await store.read('a')).toBe('1')
+    expect(await store.read('b')).toBe('2')
+    expect(await store.read('c')).toBeNull()
+  })
+
+  test('still replaces an existing key when full', async () => {
+    const store = createStore({ maxKeys: 2, clock: new ManualClock() })
+    await put(store, 'a', '1')
+    await put(store, 'b', '2')
     await put(store, 'a', '1 again')
-    await put(store, 'd', '4')
-    expect(store.size).toBe(3)
-    expect(await get(store, 'b')).toBeNull()
-    expect(store.size).toBe(3)
-    expect(await get(store, 'd')).toBe('4')
-    expect(await get(store, 'a')).toBe('1 again')
+    expect(await store.read('a')).toBe('1 again')
+    expect(store.size).toBe(2)
+  })
+
+  test('drops expired entries to make room', async () => {
+    const clock = new ManualClock()
+    const store = createStore({ maxKeys: 2, clock })
+    await put(store, 'a', '1', 100)
+    await put(store, 'b', '2', 1_000)
+    clock.advance(100)
+    await put(store, 'c', '3')
+    expect(await store.read('b')).toBe('2')
+    expect(await store.read('c')).toBe('3')
+    expect(store.size).toBe(2)
+  })
+
+  test('accepts new keys again once space is freed', async () => {
+    const store = createStore({ maxKeys: 1, clock: new ManualClock() })
+    await put(store, 'a', '1')
+    await expect(put(store, 'b', '2')).rejects.toBeInstanceOf(StoreUnavailableError)
+    await store.delete('a')
+    await put(store, 'b', '2')
+    expect(await store.read('b')).toBe('2')
   })
 
   test('never holds more than maxKeys entries', async () => {
     const store = createStore({ maxKeys: 10, clock: new ManualClock() })
-    for (let index = 0; index < 1_000; index += 1) {
-      await put(store, `key-${index}`, String(index))
+    for (let index = 0; index < 100; index += 1) {
+      await put(store, `key-${index}`, String(index)).catch(() => undefined)
       expect(store.size).toBeLessThanOrEqual(10)
     }
-    expect(store.size).toBe(10)
-    expect(await get(store, 'key-999')).toBe('999')
-    expect(await get(store, 'key-0')).toBeNull()
+    expect(await get(store, 'key-0')).toBe('0')
+    expect(await get(store, 'key-99')).toBeNull()
+  })
+
+  test('keeps the key out of the error message', async () => {
+    const store = createStore({ maxKeys: 1, clock: new ManualClock() })
+    await put(store, 'a', '1')
+    const error = await put(store, 'secret-store-key', '2').catch((caught: unknown) => caught)
+    expect(String(error)).toBe('StoreUnavailableError: Idempotency store is full')
   })
 })
 
@@ -230,45 +258,45 @@ describe('MemoryStore maxBytes', () => {
     expect(store.bytes).toBe(7)
   })
 
-  test('evicts the least recently updated keys until the total fits', async () => {
+  test('refuses a write that would pass maxBytes and keeps every entry', async () => {
     const store = createStore({ maxBytes: 20, clock: new ManualClock() })
     await put(store, 'a', '1234')
     await put(store, 'b', '1234')
     await put(store, 'c', '1234')
-    await put(store, 'a', '1234')
-    await put(store, 'd', '1234567890')
-    expect(await store.read('b')).toBeNull()
-    expect(await store.read('c')).toBeNull()
+    await expect(put(store, 'd', '1234567890')).rejects.toBeInstanceOf(StoreUnavailableError)
     expect(await store.read('a')).toBe('1234')
-    expect(await store.read('d')).toBe('1234567890')
-    expect(store.bytes).toBe(16)
+    expect(await store.read('d')).toBeNull()
+    expect(store.bytes).toBe(15)
+  })
+
+  test('counts only the difference when replacing a key', async () => {
+    const store = createStore({ maxBytes: 10, clock: new ManualClock() })
+    await put(store, 'a', 'one')
+    await put(store, 'b', 'two')
+    await put(store, 'a', 'one!!')
+    expect(store.bytes).toBe(10)
   })
 
   test('never holds more than maxBytes of data', async () => {
     const store = createStore({ maxBytes: 100, clock: new ManualClock() })
     for (let index = 0; index < 500; index += 1) {
-      await put(store, `key-${index}`, 'x'.repeat(index % 40))
+      await put(store, `key-${index}`, 'x'.repeat(index % 40)).catch(() => undefined)
       expect(store.bytes).toBeLessThanOrEqual(100)
     }
   })
 
-  test('does not store a value larger than maxBytes and drops the old value', async () => {
+  test('refuses a value larger than maxBytes and keeps the old value', async () => {
     const store = createStore({ maxBytes: 10, clock: new ManualClock() })
     await put(store, 'a', 'one')
-    await put(store, 'b', 'two')
-    await put(store, 'a', 'x'.repeat(10))
-    expect(await store.read('a')).toBeNull()
-    expect(await store.read('b')).toBe('two')
-    expect(store.size).toBe(1)
+    await expect(put(store, 'a', 'x'.repeat(10))).rejects.toBeInstanceOf(StoreUnavailableError)
+    expect(await store.read('a')).toBe('one')
     expect(store.bytes).toBe(4)
   })
 
   test('stores a value that exactly fills maxBytes', async () => {
     const store = createStore({ maxBytes: 10, clock: new ManualClock() })
-    await put(store, 'b', 'two')
     await put(store, 'a', 'x'.repeat(9))
     expect(await store.read('a')).toBe('x'.repeat(9))
-    expect(await store.read('b')).toBeNull()
     expect(store.bytes).toBe(10)
   })
 })

@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { type Clock, SystemClock, isClock } from '../core/clock'
-import { IdempotencyConfigError } from '../errors'
+import { IdempotencyConfigError, StoreUnavailableError } from '../errors'
 import { type IdempotencyStore, type StoreMutation, type StoreWrite, normalizeTtlMs } from './store'
 
 export interface MemoryStoreOptions {
@@ -96,11 +96,26 @@ export class MemoryStore implements IdempotencyStore {
   private set(key: string, value: string, ttlMs: number): void {
     const expiresAt = this.clock.now() + normalizeTtlMs(ttlMs)
     const bytes = key.length + value.length
+    this.makeRoom(key, bytes)
     this.remove(key)
-    if (bytes > this.maxBytes) return
     this.entries.set(key, { value, expiresAt, bytes })
     this.usedBytes += bytes
-    this.evictOverflow()
+  }
+
+  private makeRoom(key: string, bytes: number): void {
+    const now = this.clock.now()
+    while (!this.fits(key, bytes)) {
+      const oldest = this.entries.entries().next()
+      if (oldest.done === true || !this.isExpired(oldest.value[1], now)) throw new StoreUnavailableError('Idempotency store is full')
+      this.remove(oldest.value[0])
+    }
+  }
+
+  private fits(key: string, bytes: number): boolean {
+    const replaced = this.entries.get(key)
+    const keys = this.entries.size + (replaced === undefined ? 1 : 0)
+    const total = this.usedBytes - (replaced?.bytes ?? 0) + bytes
+    return keys <= this.maxKeys && total <= this.maxBytes
   }
 
   private remove(key: string): void {
@@ -108,14 +123,6 @@ export class MemoryStore implements IdempotencyStore {
     if (entry === undefined) return
     this.entries.delete(key)
     this.usedBytes -= entry.bytes
-  }
-
-  private evictOverflow(): void {
-    while (this.entries.size > this.maxKeys || this.usedBytes > this.maxBytes) {
-      const oldest = this.entries.keys().next()
-      if (oldest.done === true) return
-      this.remove(oldest.value)
-    }
   }
 
   private sweep(): void {

@@ -122,6 +122,30 @@ describe('RequestFingerprint.compute', () => {
     expect(cancelled).toBe(true)
   })
 
+  test('stops reading and rejects when aborted mid-body', async () => {
+    let pulls = 0
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => controller.enqueue(new Uint8Array(8)),
+      pull: () => {
+        pulls += 1
+      },
+    })
+    const request = new Request('http://localhost/upload', { method: 'POST', body })
+    const stop = new AbortController()
+    const result = RequestFingerprint.compute(request, stop.signal)
+    stop.abort()
+    await expect(result).rejects.toThrow()
+    const pullsAtAbort = pulls
+    await request.body?.cancel()
+    expect(pulls).toBe(pullsAtAbort)
+  })
+
+  test('rejects at once when already aborted', async () => {
+    const request = new Request('http://localhost/orders', { method: 'POST', body: '{"a":1}' })
+    await expect(RequestFingerprint.compute(request, AbortSignal.abort())).rejects.toThrow()
+    expect(await request.text()).toBe('{"a":1}')
+  })
+
   test('streams a 50 MB body without holding it in memory', async () => {
     const totalBytes = 50 * MEGABYTE
     const request = new Request('http://localhost/upload', { method: 'POST', body: generatedBody(totalBytes) })

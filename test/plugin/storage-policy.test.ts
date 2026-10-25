@@ -6,7 +6,7 @@ describe('defaultShouldStore', () => {
     expect(defaultShouldStore(status)).toBe(true)
   })
 
-  test.each([408, 409, 425, 429, 500, 502, 503, 599])('keeps %i retryable', (status) => {
+  test.each([401, 403, 408, 409, 425, 429, 500, 502, 503, 599])('keeps %i retryable', (status) => {
     expect(defaultShouldStore(status)).toBe(false)
   })
 })

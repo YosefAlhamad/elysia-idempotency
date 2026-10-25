@@ -8,11 +8,16 @@ export type WriteAction = 'set' | 'delete' | 'keep'
 export class ObservedStore implements IdempotencyStore {
   private readonly actions: WriteAction[] = []
   private readonly waiters = new Map<WriteAction, Deferred<void>>()
+  private callCount = 0
 
   constructor(readonly inner: MemoryStore = new MemoryStore({ clock: new ManualClock() })) {}
 
   get writes(): readonly WriteAction[] {
     return this.actions
+  }
+
+  get calls(): number {
+    return this.callCount
   }
 
   next(action: WriteAction): Promise<void> {
@@ -22,10 +27,12 @@ export class ObservedStore implements IdempotencyStore {
   }
 
   read(key: string): Promise<string | null> {
+    this.callCount += 1
     return this.inner.read(key)
   }
 
   update<TResult>(key: string, mutation: StoreMutation<TResult>): Promise<TResult> {
+    this.callCount += 1
     return this.inner.update(key, (current) => {
       const write = mutation(current)
       this.record(write.action)
@@ -34,6 +41,7 @@ export class ObservedStore implements IdempotencyStore {
   }
 
   delete(key: string): Promise<void> {
+    this.callCount += 1
     return this.inner.delete(key)
   }
 
