@@ -1,5 +1,7 @@
 # elysia-idempotency
 
+[![elysia-idempotency: retries are safe, charges happen once](.github/assets/hero.png)](https://idempotency.yosefalhamad.com)
+
 `Idempotency-Key` support for [Elysia](https://elysiajs.com) on Bun: when a client retries a `POST`, the handler runs once and every retry gets the original response.
 
 **Live demo:** fire retries, double clicks, and races at a real endpoint and watch what the plugin does at [idempotency.yosefalhamad.com](https://idempotency.yosefalhamad.com).

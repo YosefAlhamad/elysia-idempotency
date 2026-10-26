@@ -4,3 +4,4 @@ exact = false
 [test]
 coverageThreshold = { lines = 0.9, functions = 0.5 }
 coverageSkipTestFiles = true
+coveragePathIgnorePatterns = ["test/**"]
